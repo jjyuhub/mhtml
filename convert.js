@@ -65,83 +65,111 @@ async function fetchAsDataURL(u) {
   return `data:${ct};base64,${buf.toString("base64")}`;
 }
 
-// Inline url(...) inside CSS; resolves relative URLs against baseHref when provided.
+/* ---------- SAFE @import INLINER (regex-based, no AST mutation) ---------- */
+// Recursively inlines @import rules using a conservative regex, then returns CSS.
+async function inlineCssImports(css, baseHref) {
+  if (!css) return css;
+
+  // Matches: @import url(...);  OR  @import "..."  OR  @import '...'
+  const importRe = /@import\s+(?:url\(\s*([^)\s]+)\s*\)|(['"])(.*?)\2)([^;]*);/gi;
+
+  // Replace imports one by one (sequentially) to avoid overlapping indexes.
+  let out = "";
+  let lastIndex = 0;
+  for (let m; (m = importRe.exec(css)); ) {
+    out += css.slice(lastIndex, m.index);
+    lastIndex = importRe.lastIndex;
+
+    let importUrl = (m[1] || m[3] || "").replace(/^['"]|['"]$/g, "");
+    try {
+      if (baseHref && !/^https?:|^data:|^\/\//i.test(importUrl)) {
+        importUrl = new URL(importUrl, httpToHttps(baseHref)).toString();
+      } else {
+        importUrl = httpToHttps(importUrl);
+      }
+    } catch {
+      // leave as-is if URL construction fails
+    }
+
+    let importedCss = await fetchText(importUrl);
+    if (!importedCss) {
+      // If we can't fetch it, drop the import (better than leaving outbound requests)
+      continue;
+    }
+    // Recursively inline nested imports and url(...) within imported CSS
+    importedCss = await inlineCssImports(importedCss, importUrl);
+    importedCss = await inlineCssUrls(importedCss, importUrl);
+    out += importedCss;
+  }
+  out += css.slice(lastIndex);
+  return out;
+}
+
+/* ---------- url(...) INLINER (css-tree based, with try/catch fallback) ---------- */
 async function inlineCssUrls(css, baseHref = "") {
   if (!css) return css;
 
-  const ast = csstree.parse(css, { parseValue: true, parseRulePrelude: true });
-  const tasks = [];
+  try {
+    const ast = csstree.parse(css, { parseValue: true, parseRulePrelude: true });
+    const tasks = [];
 
-  csstree.walk(ast, (node) => {
-    if (node.type === "Url" && node.value) {
-      const raw0 = String(node.value);
-      const raw = raw0.replace(/^['"]|['"]$/g, "");
-      if (raw.startsWith("data:")) return;
+    csstree.walk(ast, (node) => {
+      if (node.type === "Url" && node.value) {
+        const raw0 = String(node.value);
+        const raw = raw0.replace(/^['"]|['"]$/g, "");
+        if (raw.startsWith("data:")) return;
 
-      // Resolve relative
-      let u = raw;
-      try {
-        if (baseHref && !/^https?:|^data:|^\/\//i.test(raw)) {
-          u = new URL(raw, httpToHttps(baseHref)).toString();
-        }
-      } catch { /* ignore */ }
+        // Resolve relative
+        let u = raw;
+        try {
+          if (baseHref && !/^https?:|^data:|^\/\//i.test(raw)) {
+            u = new URL(raw, httpToHttps(baseHref)).toString();
+          }
+        } catch { /* ignore */ }
 
-      tasks.push(
-        (async () => {
-          const dataURL = await fetchAsDataURL(u);
-          node.value = dataURL || httpToHttps(u); // inline, else at least https
-        })()
-      );
-    }
-  });
-
-  await Promise.all(tasks);
-  return csstree.generate(ast);
-}
-
-// Inline @import rules recursively
-async function inlineCssImports(css, baseHref) {
-  if (!css) return css;
-  const ast = csstree.parse(css, { parseValue: true, parseRulePrelude: true });
-  const parts = [];
-
-  for (const node of ast.children.toArray()) {
-    if (node.type === "Atrule" && node.name === "import") {
-      const prelude = csstree.generate(node.prelude || "");
-      const m = /url\(([^)]+)\)|(['"])(.*?)\2/.exec(prelude);
-      const importUrlRaw = m ? (m[1] || m[3]) : null;
-      if (!importUrlRaw) continue;
-
-      let url = importUrlRaw.replace(/^['"]|['"]$/g, "");
-      try {
-        if (baseHref && !/^https?:|^data:|^\/\//i.test(url)) {
-          url = new URL(url, httpToHttps(baseHref)).toString();
-        } else {
-          url = httpToHttps(url);
-        }
-      } catch { /* ignore */ }
-
-      const importedCss = await fetchText(url);
-      if (importedCss) {
-        // Recursively inline imports and URLs in the imported CSS
-        let inlined = await inlineCssImports(importedCss, url);
-        inlined = await inlineCssUrls(inlined, url);
-        // Replace the @import node with the actual CSS rules
-        const importedAst = csstree.parse(inlined, {
-          parseValue: true,
-          parseRulePrelude: true
-        });
-        parts.push(...importedAst.children.toArray());
-        ast.children.remove(node);
+        tasks.push(
+          (async () => {
+            const dataURL = await fetchAsDataURL(u);
+            node.value = dataURL || httpToHttps(u); // inline, else at least https
+          })()
+        );
       }
-    }
-  }
+    });
 
-  // Append imported parts (if any)
-  for (const n of parts) ast.children.appendData(n);
-  return csstree.generate(ast);
+    await Promise.all(tasks);
+    return csstree.generate(ast);
+  } catch {
+    // Fallback: lightweight regex for url(...). Not perfect, but safe.
+    return await cssUrlRegexInline(css, baseHref);
+  }
 }
 
+async function cssUrlRegexInline(css, baseHref = "") {
+  const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
+  const parts = [];
+  let last = 0, m;
+  while ((m = urlRe.exec(css))) {
+    parts.push(css.slice(last, m.index));
+    last = urlRe.lastIndex;
+
+    let u = m[2];
+    if (u.startsWith("data:")) { parts.push(`url(${m[1]}${u}${m[1]})`); continue; }
+    try {
+      if (baseHref && !/^https?:|^data:|^\/\//i.test(u)) {
+        u = new URL(u, httpToHttps(baseHref)).toString();
+      } else {
+        u = httpToHttps(u);
+      }
+    } catch { /* ignore */ }
+
+    const dataURL = await fetchAsDataURL(u);
+    parts.push(`url(${m[1]}${dataURL || u}${m[1]})`);
+  }
+  parts.push(css.slice(last));
+  return parts.join("");
+}
+
+/* ---------- HTML INLINER ---------- */
 async function inlineEverything(html, docUrl = "") {
   const $ = cheerio.load(html, { decodeEntities: false });
 
@@ -176,7 +204,7 @@ async function inlineEverything(html, docUrl = "") {
     $(el).replaceWith(`<style>${css}</style>`);
   }
 
-  // <style> blocks (inline url(...) and @import if any)
+  // <style> blocks (inline @import + url(...))
   for (const el of $("style").toArray()) {
     let css = $(el).html() || "";
     css = await inlineCssImports(css, docUrl);
@@ -231,6 +259,7 @@ async function inlineEverything(html, docUrl = "") {
   return $.html({ decodeEntities: false });
 }
 
+/* ---------- MAIN ---------- */
 const links = [];
 
 for (const file of files) {
