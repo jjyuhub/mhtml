@@ -1,4 +1,4 @@
-name: Deploy MHTML to GitHub Pages (root)
+name: Deploy MHTML to GitHub Pages (root, self-contained)
 
 on:
   push:
@@ -8,6 +8,7 @@ on:
       - "*.mht"
       - "convert.js"
       - "package.json"
+      - "package-lock.json"
       - ".github/workflows/pages.yml"
 
 permissions:
@@ -30,12 +31,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          # removed: cache: npm  (no lockfile)
+          cache: "npm"
 
       - name: Install deps
-        run: npm install   # instead of npm ci
+        run: npm ci
 
-      - name: Build (convert .mhtml → /dist)
+      # SingleFile CLI will download a compatible Chromium via Puppeteer on first run.
+      # (This allows it to fetch external fonts/CSS/JS and inline them as data URIs.)
+      - name: Build (MHTML -> self-contained HTML in /dist)
         run: npm run build
 
       - name: Upload artifact
