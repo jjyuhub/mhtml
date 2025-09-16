@@ -10,10 +10,10 @@ import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";          // <-- FIXED: namespace import
 import csstree from "css-tree";
 import fetch from "node-fetch";
-import mime from "mime-types";
+import { lookup as mimeLookup } from "mime-types"; // <-- explicit import
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -60,7 +60,7 @@ for (const file of files) {
     `--browser-args="${browserArgs.join(" ")}"`
   ]);
 
-  // Safety: if SingleFile returned nothing, at least read the original MHTML as text (rare)
+  // Safety: if SingleFile returned nothing, at least show something
   if (!html || !html.trim()) html = await fallbackHtml(file);
 
   // 2) Hard-inline remaining external assets
@@ -103,7 +103,6 @@ function runAndCapture(cmd, args) {
 }
 
 async function fallbackHtml(file) {
-  // Last resort: put something visible if SingleFile failed completely
   return `<!doctype html><meta charset="utf-8"><title>${file}</title><h1>Snapshot failed</h1>`;
 }
 
@@ -120,15 +119,22 @@ async function fetchAsDataURL(u) {
   const res = await fetch(url).catch(() => null);
   if (!res || !res.ok) return null;
   const buf = Buffer.from(await res.arrayBuffer());
-  const ct = res.headers.get("content-type") || mime.lookup(url) || "application/octet-stream";
+  const ct = res.headers.get("content-type") || mimeLookup(url) || "application/octet-stream";
   const b64 = buf.toString("base64");
   return `data:${ct};base64,${b64}`;
+}
+
+async function fetchText(u) {
+  const url = httpToHttps(u);
+  const res = await fetch(url).catch(() => null);
+  if (!res || !res.ok) return null;
+  return await res.text();
 }
 
 async function inlineAll(html) {
   const $ = cheerio.load(html, { decodeEntities: false });
 
-  // Remove trackers/ads and hints that cause outbound requests
+  // Remove trackers/ads & hints that cause outbound requests
   $('script[src*="doubleclick"],script[src*="googletag"],script[src*="tr.snapchat"],script[src*="stripe"]').remove();
   $('link[rel="preconnect"],link[rel="dns-prefetch"],link[rel="preload"],link[rel="prefetch"]').remove();
 
@@ -150,7 +156,7 @@ async function inlineAll(html) {
     if (data) $(el).attr("src", data);
   }
 
-  // <script src="..."> -> inline content (only if first-party-ish; skip known trackers above)
+  // <script src="..."> -> inline content (skip known trackers already removed)
   for (const el of $('script[src]').toArray()) {
     const src = $(el).attr("src");
     if (!src) continue;
@@ -173,7 +179,7 @@ async function inlineAll(html) {
     $(el).attr("style", inlined);
   }
 
-  // Force any remaining absolute http(s) links for fonts/images to be data: or https
+  // Upgrade any remaining absolute http:// links to https:// as a last resort
   $('link[href], img[src], script[src]').each((_, el) => {
     const $el = $(el);
     const attr = $el.is("link") ? "href" : "src";
@@ -182,13 +188,6 @@ async function inlineAll(html) {
   });
 
   return $.html({ decodeEntities: false });
-}
-
-async function fetchText(u) {
-  const url = httpToHttps(u);
-  const res = await fetch(url).catch(() => null);
-  if (!res || !res.ok) return null;
-  return await res.text();
 }
 
 async function inlineCssUrls(css, baseHref = "") {
@@ -200,7 +199,6 @@ async function inlineCssUrls(css, baseHref = "") {
   csstree.walk(ast, (node) => {
     if (node.type === "Url" && node.value) {
       const raw = String(node.value).replace(/^['"]|['"]$/g, "");
-      // skip already inlined
       if (raw.startsWith("data:")) return;
 
       // resolve relative against base (if given)
@@ -215,7 +213,7 @@ async function inlineCssUrls(css, baseHref = "") {
         (async () => {
           const dataURL = await fetchAsDataURL(u);
           if (dataURL) node.value = dataURL;
-          else node.value = httpToHttps(u); // at least upgrade to https
+          else node.value = httpToHttps(u); // upgrade to https at minimum
         })()
       );
     }
