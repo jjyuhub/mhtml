@@ -11,10 +11,9 @@ import os from "os";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import * as cheerio from "cheerio";
-import * as csstree from "css-tree";   // <-- fixed
+import * as csstree from "css-tree";
 import fetch from "node-fetch";
 import { lookup as mimeLookup } from "mime-types";
-
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,16 +48,18 @@ for (const file of files) {
   );
   const mhtmlUrl = `file://${path.join(__dirname, file).replace(/ /g, "%20")}`;
 
-  // Allow insecure content during *build* so we can fetch and inline it
+  // Allow insecure content during *build* so SingleFile can fetch then inline it
   const browserArgs = [
     "--allow-file-access-from-files",
     "--disable-web-security",
     "--allow-running-insecure-content"
   ];
+
   let html = await runAndCapture(singleFileBin, [
     mhtmlUrl,
     "--dump-content",
-    `--browser-args="${browserArgs.join(" ")}"`
+    "--browser-args",
+    JSON.stringify(browserArgs) // <-- correct JSON array
   ]);
 
   // Safety: if SingleFile returned nothing, at least show something
@@ -93,7 +94,7 @@ function runAndCapture(cmd, args) {
   return new Promise((resolve, reject) => {
     let out = Buffer.alloc(0);
     let err = "";
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], shell: true });
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], shell: false }); // <-- no shell
     p.stdout.on("data", (d) => (out = Buffer.concat([out, d])));
     p.stderr.on("data", (d) => (err += d.toString()));
     p.on("close", (code) => {
