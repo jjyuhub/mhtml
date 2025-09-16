@@ -3,13 +3,11 @@ name: Deploy MHTML to GitHub Pages (root)
 on:
   push:
     branches: [ main ]
-    # trigger when root mhtml/mht or build files change
     paths:
       - "*.mhtml"
       - "*.mht"
       - "convert.js"
       - "package.json"
-      - "package-lock.json"
       - ".github/workflows/pages.yml"
 
 permissions:
@@ -32,10 +30,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
+          # removed: cache: npm  (no lockfile)
 
       - name: Install deps
-        run: npm ci
+        run: npm install   # instead of npm ci
 
       - name: Build (convert .mhtml → /dist)
         run: npm run build
