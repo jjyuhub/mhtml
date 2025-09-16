@@ -10,10 +10,11 @@ import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import * as cheerio from "cheerio";          // <-- FIXED: namespace import
-import csstree from "css-tree";
+import * as cheerio from "cheerio";
+import * as csstree from "css-tree";   // <-- fixed
 import fetch from "node-fetch";
-import { lookup as mimeLookup } from "mime-types"; // <-- explicit import
+import { lookup as mimeLookup } from "mime-types";
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
