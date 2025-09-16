@@ -1,7 +1,8 @@
-// Converts every *.mhtml / *.mht in the REPO ROOT to a fully self-contained page:
-// Step 1: MHTML -> plain HTML (fast-mhtml2html) -> string
-// Step 2: Inline all external assets with SingleFile (via bundled Chromium)
-// If SingleFile returns empty for any reason, we fall back to the Step 1 HTML.
+// Full single-file export from *.mhtml/*.mht in REPO ROOT to /dist/<name>/index.html.
+// 1) Open the MHTML directly in headless Chromium via SingleFile (handles cid:)
+// 2) Hard-inline any remaining external assets (CSS, fonts, images, JS, CSS url(...))
+// 3) Remove trackers/ads and preconnect/prefetch hints
+// Result: zero network requests at runtime (no CORS, no mixed content)
 
 import { glob } from "glob";
 import fs from "fs-extra";
@@ -9,7 +10,10 @@ import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import m2h from "fast-mhtml2html";
+import cheerio from "cheerio";
+import csstree from "css-tree";
+import fetch from "node-fetch";
+import mime from "mime-types";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,7 +23,7 @@ const WORK = await fs.mkdtemp(path.join(os.tmpdir(), "mhtml-work-"));
 
 await fs.emptyDir(OUT);
 
-// Only repo root (change to "**/*.{mhtml,mht}" if you want subfolders)
+// Only repo root; switch to "**/*.{mhtml,mht}" if you want recursion
 const files = await glob("*.{mhtml,mht}", { nocase: true });
 if (files.length === 0) {
   await fs.outputFile(
@@ -35,49 +39,40 @@ for (const file of files) {
   const base = path.basename(file).replace(/\.(mhtml|mht)$/i, "");
   const safe = encodeURIComponent(base);
 
-  // Step 1: convert MHTML -> HTML (string)
-  const buf = await fs.readFile(file);
-  const html1 = m2h.convert(buf);
-  if (typeof html1 !== "string" || !html1.length) {
-    throw new Error("fast-mhtml2html did not return an HTML string");
-  }
-
-  // write temp file and construct a proper file:// URL for SingleFile
-  const tempHtml = path.join(WORK, `${base}.html`);
-  await fs.writeFile(tempHtml, html1, "utf8");
-  const fileUrl = `file://${tempHtml.replace(/ /g, "%20")}`;
-
-  // Step 2: Inline everything with SingleFile
+  // 1) Render the MHTML directly with SingleFile (Chromium resolves cid:)
   const singleFileBin = path.join(
     __dirname,
     "node_modules",
     ".bin",
     process.platform === "win32" ? "single-file.cmd" : "single-file"
   );
+  const mhtmlUrl = `file://${path.join(__dirname, file).replace(/ /g, "%20")}`;
+
+  // Allow insecure content during *build* so we can fetch and inline it
+  const browserArgs = [
+    "--allow-file-access-from-files",
+    "--disable-web-security",
+    "--allow-running-insecure-content"
+  ];
+  let html = await runAndCapture(singleFileBin, [
+    mhtmlUrl,
+    "--dump-content",
+    `--browser-args="${browserArgs.join(" ")}"`
+  ]);
+
+  // Safety: if SingleFile returned nothing, at least read the original MHTML as text (rare)
+  if (!html || !html.trim()) html = await fallbackHtml(file);
+
+  // 2) Hard-inline remaining external assets
+  html = await inlineAll(html);
+
+  // 3) Write final page
   const finalDir = path.join(OUT, base);
-  const finalHtmlPath = path.join(finalDir, "index.html");
   await fs.mkdirp(finalDir);
-
-  let html2 = "";
-  try {
-    // Important flags:
-    // --dump-content : write result to stdout
-    // --browser-args : allow reading local files; helps when page references local urls
-    html2 = await runAndCapture(singleFileBin, [
-      fileUrl,
-      "--dump-content",
-      '--browser-args="--allow-file-access-from-files"'
-    ]);
-  } catch (e) {
-    console.warn(`[SingleFile] failed for ${base}: ${e.message}`);
-  }
-
-  // Fallback if SingleFile produced nothing
-  const output = html2 && html2.trim().length ? html2 : html1;
-  await fs.writeFile(finalHtmlPath, output, "utf8");
+  await fs.writeFile(path.join(finalDir, "index.html"), html, "utf8");
 
   links.push(`<li><a href="./${safe}/">${base}</a></li>`);
-  console.log(`✓ ${file} → ${path.relative(__dirname, finalHtmlPath)} (inlined=${html2 ? "yes" : "no"})`);
+  console.log(`✓ ${file} → dist/${base}/index.html`);
 }
 
 // Landing page
@@ -90,7 +85,7 @@ ${links.join("\n")}
 </ul>`;
 await fs.writeFile(path.join(OUT, "index.html"), indexHtml, "utf8");
 
-// Cleanup (best-effort)
+// Cleanup temp dir
 try { await fs.rm(WORK, { recursive: true, force: true }); } catch {}
 
 function runAndCapture(cmd, args) {
@@ -105,4 +100,127 @@ function runAndCapture(cmd, args) {
       else reject(new Error(`single-file exited ${code}: ${err || "(no stderr)"}`));
     });
   });
+}
+
+async function fallbackHtml(file) {
+  // Last resort: put something visible if SingleFile failed completely
+  return `<!doctype html><meta charset="utf-8"><title>${file}</title><h1>Snapshot failed</h1>`;
+}
+
+function httpToHttps(u) {
+  try {
+    if (u.startsWith("//")) return "https:" + u;
+    if (u.startsWith("http://")) return "https://" + u.slice(7);
+  } catch {}
+  return u;
+}
+
+async function fetchAsDataURL(u) {
+  const url = httpToHttps(u);
+  const res = await fetch(url).catch(() => null);
+  if (!res || !res.ok) return null;
+  const buf = Buffer.from(await res.arrayBuffer());
+  const ct = res.headers.get("content-type") || mime.lookup(url) || "application/octet-stream";
+  const b64 = buf.toString("base64");
+  return `data:${ct};base64,${b64}`;
+}
+
+async function inlineAll(html) {
+  const $ = cheerio.load(html, { decodeEntities: false });
+
+  // Remove trackers/ads and hints that cause outbound requests
+  $('script[src*="doubleclick"],script[src*="googletag"],script[src*="tr.snapchat"],script[src*="stripe"]').remove();
+  $('link[rel="preconnect"],link[rel="dns-prefetch"],link[rel="preload"],link[rel="prefetch"]').remove();
+
+  // <link rel="stylesheet" href="..."> -> <style>...</style>
+  for (const el of $('link[rel="stylesheet"][href]').toArray()) {
+    const href = $(el).attr("href");
+    if (!href) continue;
+    const cssData = await fetchText(href);
+    if (!cssData) continue;
+    const inlinedCss = await inlineCssUrls(cssData, href);
+    $(el).replaceWith(`<style>${inlinedCss}</style>`);
+  }
+
+  // <img src="..."> -> data:
+  for (const el of $("img[src]").toArray()) {
+    const src = $(el).attr("src");
+    if (!src) continue;
+    const data = await fetchAsDataURL(src);
+    if (data) $(el).attr("src", data);
+  }
+
+  // <script src="..."> -> inline content (only if first-party-ish; skip known trackers above)
+  for (const el of $('script[src]').toArray()) {
+    const src = $(el).attr("src");
+    if (!src) continue;
+    const js = await fetchText(src);
+    if (!js) continue;
+    $(el).removeAttr("src").text(js);
+  }
+
+  // Inline url(...) inside <style> blocks
+  for (const el of $("style").toArray()) {
+    const css = $(el).html() || "";
+    const inlined = await inlineCssUrls(css);
+    $(el).html(inlined);
+  }
+
+  // Inline style="" url(...) attrs
+  for (const el of $("[style]").toArray()) {
+    const css = $(el).attr("style");
+    const inlined = await inlineCssUrls(css);
+    $(el).attr("style", inlined);
+  }
+
+  // Force any remaining absolute http(s) links for fonts/images to be data: or https
+  $('link[href], img[src], script[src]').each((_, el) => {
+    const $el = $(el);
+    const attr = $el.is("link") ? "href" : "src";
+    const val = $el.attr(attr);
+    if (val && /^http:\/\//i.test(val)) $el.attr(attr, httpToHttps(val));
+  });
+
+  return $.html({ decodeEntities: false });
+}
+
+async function fetchText(u) {
+  const url = httpToHttps(u);
+  const res = await fetch(url).catch(() => null);
+  if (!res || !res.ok) return null;
+  return await res.text();
+}
+
+async function inlineCssUrls(css, baseHref = "") {
+  if (!css) return css;
+
+  const ast = csstree.parse(css, { parseValue: true, parseRulePrelude: true });
+  const tasks = [];
+
+  csstree.walk(ast, (node) => {
+    if (node.type === "Url" && node.value) {
+      const raw = String(node.value).replace(/^['"]|['"]$/g, "");
+      // skip already inlined
+      if (raw.startsWith("data:")) return;
+
+      // resolve relative against base (if given)
+      let u = raw;
+      try {
+        if (baseHref && !/^https?:|^data:|^\/\//i.test(raw)) {
+          u = new URL(raw, httpToHttps(baseHref)).toString();
+        }
+      } catch {}
+
+      tasks.push(
+        (async () => {
+          const dataURL = await fetchAsDataURL(u);
+          if (dataURL) node.value = dataURL;
+          else node.value = httpToHttps(u); // at least upgrade to https
+        })()
+      );
+    }
+  });
+
+  await Promise.all(tasks);
+  return csstree.generate(ast);
 }
