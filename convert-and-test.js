@@ -1,8 +1,8 @@
 // Offline-exact MHTML → single-file HTML with layout test.
-// - NO external requests allowed.
-// - Render .mhtml offline, snapshot to single-file HTML (using the browser itself).
-// - Re-render the produced HTML offline and pixel-diff against the MHTML render.
-// - Fail the build if any external request is attempted or if the diff is above threshold.
+// - NO external requests are allowed (all http(s) aborted).
+// - We DO NOT fail the build just because scripts attempted to request them.
+// - We snapshot the rendered MHTML DOM into one HTML, re-render it offline,
+//   then pixel-diff. Build fails only on layout mismatch beyond threshold.
 
 import fs from "fs-extra";
 import path from "path";
@@ -21,8 +21,8 @@ await fs.emptyDir(OUT);
 
 // config
 const VIEWPORT = { width: 1440, height: 900, deviceScaleFactor: 1 };
-const DIFF_THRESHOLD = 0.01; // ≤1% pixels may differ (antialias etc.)
-const FILE_GLOB = "*.mhtml"; // root only; change to **/*.mhtml if you like
+const DIFF_THRESHOLD = 0.01; // allow ≤1% pixels (antialias)
+const FILE_GLOB = "*.mhtml"; // root; change to **/*.mhtml if desired
 
 const files = await glob(FILE_GLOB, { nocase: true, cwd: ROOT });
 if (files.length === 0) {
@@ -51,34 +51,23 @@ async function withOfflinePage(fn) {
   await page.setViewport(VIEWPORT);
   await page.setOfflineMode(true);
 
-  // block any http(s) requests; record attempts
-  const externalAttempts = [];
+  // Block any http(s) request; just abort it silently.
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     const url = req.url();
-    if (/^https?:\/\//i.test(url)) {
-      externalAttempts.push(url);
-      return req.abort("blockedbyclient");
-    }
+    if (/^https?:\/\//i.test(url)) return req.abort("blockedbyclient");
     req.continue();
   });
 
-  const result = await fn(page, externalAttempts);
-
-  await page.close();
-
-  if (result?.externalAttempts && result.externalAttempts.length) {
-    throw new Error(
-      `External requests attempted:\n- ${result.externalAttempts.slice(0, 10).join("\n- ")}${result.externalAttempts.length > 10 ? "\n..." : ""}`
-    );
+  try {
+    return await fn(page);
+  } finally {
+    await page.close();
   }
-  return result;
 }
 
-// Use the browser itself to serialize the currently loaded DOM into a single HTML.
-// We avoid any network: all resources in the DOM are already loaded from the MHTML container.
+// Serialize the current page into a single HTML using only already-loaded resources.
 async function snapshotSingleFile(page) {
-  // Inline <link rel="stylesheet"> by reading CSSOM; inline <img>, <link icon>, etc. as data URLs.
   const html = await page.evaluate(async () => {
     const toDataURL = async (url) => {
       try {
@@ -92,10 +81,9 @@ async function snapshotSingleFile(page) {
       }
     };
 
-    // Inline stylesheets
+    // Inline stylesheets via CSSOM
     for (const link of Array.from(document.querySelectorAll('link[rel="stylesheet"]'))) {
       try {
-        // If the sheet is loaded, read CSS rules via CSSOM
         const sheet = Array.from(document.styleSheets).find(s => s.ownerNode === link);
         if (sheet && sheet.cssRules) {
           let css = "";
@@ -103,18 +91,19 @@ async function snapshotSingleFile(page) {
           const style = document.createElement("style");
           style.textContent = css;
           link.replaceWith(style);
+        } else {
+          // unreadable/cross-origin → drop; we are offline
+          link.remove();
         }
       } catch {
-        // cross-origin or unreadable -> drop the link; we are offline-only
         link.remove();
       }
     }
 
-    // Inline <img> and icons if they’re blob: or other internal URLs
+    // Inline <img> and icons when accessible (blob:/file:/data:)
     const inlineSrcAttr = async (el, attr) => {
       const src = el.getAttribute(attr);
       if (!src || src.startsWith("data:")) return;
-      // Only try to inline if it’s resolvable by fetch() in this offline page (blob:, file:, etc.)
       if (/^(blob:|data:|file:|chrome-extension:|chrome:|about:)/i.test(src)) {
         const data = await toDataURL(src);
         if (data) el.setAttribute(attr, data);
@@ -125,12 +114,11 @@ async function snapshotSingleFile(page) {
       await inlineSrcAttr(img, "src");
       if (img.srcset) img.removeAttribute("srcset");
     }
-
     for (const link of Array.from(document.querySelectorAll('link[rel="icon"],link[rel="shortcut icon"],link[rel="apple-touch-icon"]'))) {
       await inlineSrcAttr(link, "href");
     }
 
-    // Inline CSS url() references for stylesheet tags we created above:
+    // Inline url(...) inside any <style> (try to data-embed blob/file)
     const inlineCssUrls = async (styleEl) => {
       const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
       let css = styleEl.textContent || "";
@@ -142,7 +130,7 @@ async function snapshotSingleFile(page) {
         const u = m[2];
         if (/^data:/i.test(u)) { parts.push(m[0]); continue; }
         if (!/^(blob:|data:|file:|chrome-extension:|chrome:|about:)/i.test(u)) {
-          // external-looking; we skip it (offline)
+          // external-looking (would be blocked anyway) → leave as-is
           parts.push(`url(${m[1]}${u}${m[1]})`);
           continue;
         }
@@ -152,22 +140,19 @@ async function snapshotSingleFile(page) {
       parts.push(css.slice(last));
       styleEl.textContent = parts.join("");
     };
-
     for (const styleEl of Array.from(document.querySelectorAll("style"))) {
       await inlineCssUrls(styleEl);
     }
 
-    // Serialize
-    const doc = document.documentElement.cloneNode(true);
-    // Drop preconnect/prefetch/preload hints
-    for (const n of Array.from(doc.querySelectorAll('link[rel="preconnect"],link[rel="dns-prefetch"],link[rel="preload"],link[rel="prefetch"]'))) n.remove();
-    // Remove iframes (they won’t load offline anyway)
-    for (const n of Array.from(doc.querySelectorAll("iframe"))) n.remove();
+    // Remove hints/iframes that would try to load externally
+    for (const n of Array.from(document.querySelectorAll('link[rel="preconnect"],link[rel="dns-prefetch"],link[rel="preload"],link[rel="prefetch"]'))) n.remove();
+    for (const n of Array.from(document.querySelectorAll("iframe"))) n.remove();
 
-    // Ensure base href doesn’t point anywhere
-    const base = doc.querySelector("base");
+    // Neutral base
+    const base = document.querySelector("base");
     if (base) base.setAttribute("href", ".");
 
+    const doc = document.documentElement.cloneNode(true);
     return "<!DOCTYPE html>\n" + doc.outerHTML;
   });
 
@@ -175,7 +160,7 @@ async function snapshotSingleFile(page) {
 }
 
 async function renderAndScreenshot(page, url, outPngPath) {
-  await page.goto(url, { waitUntil: "load" }); // offline; only MHTML-embedded resources render
+  await page.goto(url, { waitUntil: "load" }); // offline; only embedded resources render
   const png = await page.screenshot({ type: "png" });
   await fs.writeFile(outPngPath, png);
   return PNG.sync.read(png);
@@ -183,18 +168,16 @@ async function renderAndScreenshot(page, url, outPngPath) {
 
 function diffPNGs(imgA, imgB, outPath) {
   if (imgA.width !== imgB.width || imgA.height !== imgB.height) {
-    // Different sizes -> treat as full diff
     const maxW = Math.max(imgA.width, imgB.width);
     const maxH = Math.max(imgA.height, imgB.height);
     const out = new PNG({ width: maxW, height: maxH });
-    // (leave out blank; we just fail)
     fs.writeFileSync(outPath, PNG.sync.write(out));
     return { diffPixels: Math.max(maxW * maxH, 1), total: maxW * maxH };
   }
   const { width, height } = imgA;
   const out = new PNG({ width, height });
   const diffPixels = pixelmatch(imgA.data, imgB.data, out.data, width, height, {
-    threshold: 0.1,          // anti-alias tolerance
+    threshold: 0.1,
     includeAA: true
   });
   fs.writeFileSync(outPath, PNG.sync.write(out));
@@ -214,42 +197,38 @@ for (const mhtmlRel of files) {
   const shotMhtmlPath = path.join(workDir, "__mhtml.png");
   const shotHtmlPath = path.join(workDir, "__html.png");
   const shotDiffPath = path.join(workDir, "__diff.png");
-  let externalAttempts = [];
 
-  // 1) Render the MHTML OFFLINE and snapshot a single-file HTML from the live DOM
+  // 1) Render MHTML OFFLINE and snapshot DOM → single HTML
   let htmlSerialized = "";
-  await withOfflinePage(async (page, attempts) => {
-    const img = await renderAndScreenshot(page, mhtmlUrl, shotMhtmlPath);
-    htmlSerialized = await snapshotSingleFile(page); // DOM → one HTML; uses only already loaded resources
-    return { externalAttempts: attempts };
+  await withOfflinePage(async (page) => {
+    await renderAndScreenshot(page, mhtmlUrl, shotMhtmlPath);
+    htmlSerialized = await snapshotSingleFile(page);
   }).catch(async (e) => {
     await fs.writeFile(path.join(workDir, "__error.txt"), String(e.stack || e));
     throw e;
   });
 
-  // 2) Save the serialized HTML
+  // 2) Save single HTML
   await fs.writeFile(singleHtmlPath, htmlSerialized, "utf8");
 
-  // 3) Re-render the produced HTML OFFLINE and screenshot
+  // 3) Re-render single HTML OFFLINE and screenshot
   const htmlUrl = "file://" + singleHtmlPath.replace(/ /g, "%20");
-  let imgA, imgB;
-  await withOfflinePage(async (page, attempts) => {
+  let imgB;
+  await withOfflinePage(async (page) => {
     imgB = await renderAndScreenshot(page, htmlUrl, shotHtmlPath);
-    return { externalAttempts: attempts };
   });
 
   // 4) Diff screenshots
-  imgA = PNG.sync.read(fs.readFileSync(shotMhtmlPath));
+  const imgA = PNG.sync.read(fs.readFileSync(shotMhtmlPath));
   const { diffPixels, total } = diffPNGs(imgA, imgB, shotDiffPath);
   const diffRatio = diffPixels / total;
 
-  // 5) Report & fail if not matching
+  // 5) Report; fail only on layout mismatch
   const passed = diffRatio <= DIFF_THRESHOLD;
   await fs.writeFile(
     path.join(workDir, "__report.txt"),
-    `externalAttempts: 0\npixelsDifferent: ${diffPixels}\ntotalPixels: ${total}\ndiffRatio: ${diffRatio}\nstatus: ${passed ? "PASS" : "FAIL"}\n`
+    `pixelsDifferent: ${diffPixels}\ntotalPixels: ${total}\ndiffRatio: ${diffRatio}\nstatus: ${passed ? "PASS" : "FAIL"}\n`
   );
-
   if (!passed) {
     throw new Error(
       `[${base}] layout changed too much offline: ${(diffRatio * 100).toFixed(2)}% ` +
