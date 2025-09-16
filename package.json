@@ -1,0 +1,13 @@
+{
+  "name": "mhtml-to-pages",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node convert.js"
+  },
+  "dependencies": {
+    "fs-extra": "^11.2.0",
+    "glob": "^10.4.5",
+    "mhtml-to-html": "^3.0.0"
+  }
+}
