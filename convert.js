@@ -1,8 +1,7 @@
-// Converts every *.mhtml / *.mht in the REPO ROOT to /dist/<name>/index.html
-// Fully self-contained: no network requests at runtime.
-//  - Step 1: MHTML -> HTML (resolves cid:) using mhtml-to-html@2
-//  - Step 2: Inline EVERYTHING (CSS <link>, @import, url(...), <img>, fonts, <script>, icons)
-//  - Step 3: Strip trackers/ads and upgrade http:// -> https:// as fallback.
+// Fully self-contained export from *.mhtml/*.mht in REPO ROOT to /dist/<name>/index.html.
+// Step 1: MHTML -> HTML (string) with fast-mhtml2html
+// Step 2: Hard-inline EVERYTHING: stylesheets, @import, css url(...), images, fonts, scripts, icons
+// Result: zero network requests at runtime (no CORS/mixed-content/404s).
 
 import { glob } from "glob";
 import fs from "fs-extra";
@@ -12,7 +11,7 @@ import * as cheerio from "cheerio";
 import * as csstree from "css-tree";
 import fetch from "node-fetch";
 import { lookup as mimeLookup } from "mime-types";
-import { convert as mhtmlToHtml } from "mhtml-to-html";
+import m2h from "fast-mhtml2html";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,7 +19,7 @@ const __dirname = path.dirname(__filename);
 const OUT = path.join(__dirname, "dist");
 await fs.emptyDir(OUT);
 
-// Only repo root; change to "**/*.{mhtml,mht}" to recurse
+// Only root; change to "**/*.{mhtml,mht}" to recurse
 const files = await glob("*.{mhtml,mht}", { nocase: true });
 
 if (files.length === 0) {
@@ -218,7 +217,7 @@ async function inlineEverything(html, docUrl = "") {
     $(el).removeAttr("src").text(js);
   }
 
-  // iframes: try to snapshot as images or remove (most are trackers/ads)
+  // iframes often point to trackers/ads – drop them for single-file output
   $("iframe").remove();
 
   // Last-resort: upgrade any remaining absolute http:// links to https://
@@ -238,15 +237,15 @@ for (const file of files) {
   const base = path.basename(file).replace(/\.(mhtml|mht)$/i, "");
   const safe = encodeURIComponent(base);
 
-  // Step 1: MHTML -> HTML (string or { html })
-  const raw = await mhtmlToHtml(await fs.readFile(file));
-  const html1 = typeof raw === "string" ? raw : raw?.html;
+  // Step 1: MHTML -> HTML (string)
+  const buf = await fs.readFile(file);
+  const html1 = m2h.convert(buf); // returns a string
   if (typeof html1 !== "string" || !html1.length) {
-    throw new Error("mhtml-to-html did not return an HTML string");
+    throw new Error("fast-mhtml2html did not return an HTML string");
   }
 
   // Step 2: Inline everything
-  const finalHtml = await inlineEverything(html1 /* docUrl unknown; absolute links will be fetched via their own URLs */);
+  const finalHtml = await inlineEverything(html1 /* docUrl unknown */);
 
   // Write output
   const dir = path.join(OUT, base);
