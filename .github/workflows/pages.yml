@@ -1,4 +1,4 @@
-name: Deploy MHTML to GitHub Pages (root, self-contained)
+name: Deploy MHTML to GitHub Pages (root, single-file)
 
 on:
   push:
@@ -29,12 +29,12 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"   # no cache: npm (since no lockfile)
+          node-version: "20"
 
       - name: Install deps
-        run: npm install       # instead of npm ci
+        run: npm install   # use npm ci if you commit package-lock.json
 
-      - name: Build (MHTML -> self-contained HTML in /dist)
+      - name: Build (MHTML -> ONE HTML per file)
         run: npm run build
 
       - name: Upload artifact
