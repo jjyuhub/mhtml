@@ -1,12 +1,11 @@
-name: Deploy MHTML to GitHub Pages (root, single-file)
+name: Deploy MHTML to GitHub Pages (offline, pixel-verified)
 
 on:
   push:
     branches: [ main ]
     paths:
       - "*.mhtml"
-      - "*.mht"
-      - "convert.js"
+      - "convert-and-test.js"
       - "package.json"
       - ".github/workflows/pages.yml"
 
@@ -23,18 +22,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install deps
-        run: npm install   # use npm ci if you commit package-lock.json
+        run: npm install   # use `npm ci` if you commit a lockfile
 
-      - name: Build (MHTML -> ONE HTML per file)
+      - name: Build & test offline
         run: npm run build
 
       - name: Upload artifact
