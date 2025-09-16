@@ -1,7 +1,9 @@
 // Fully self-contained export from *.mhtml/*.mht in REPO ROOT to /dist/<name>/index.html.
 // Step 1: MHTML -> HTML (string) with fast-mhtml2html
-// Step 2: Hard-inline EVERYTHING: stylesheets, @import, css url(...), images, fonts, scripts, icons
-// Result: zero network requests at runtime (no CORS/mixed-content/404s).
+// Step 2: Conservatively inline ONLY external http(s) resources:
+//         stylesheets, @import, css url(...), images, scripts, icons
+// NOTE: Anything already embedded by the MHTML snapshot (cid:, blob:, data:, mhtml: etc.)
+//       is LEFT ALONE to avoid layout breakage.
 
 import { glob } from "glob";
 import fs from "fs-extra";
@@ -30,7 +32,7 @@ if (files.length === 0) {
   process.exit(0);
 }
 
-// Use a realistic UA; some CDNs block default node UA for fonts/CSS
+// Realistic UA; some CDNs block default node UA for fonts/CSS
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 
@@ -40,6 +42,12 @@ function httpToHttps(u) {
   if (u.startsWith("http://")) return "https://" + u.slice(7);
   return u;
 }
+
+// Treat these schemes/placeholders as already-embedded (don’t touch)
+const isEmbedded = (u) =>
+  !u ||
+  /^data:|^cid:|^blob:|^mhtml:|^cid!|^about:blank/i.test(u) ||
+  /^https?!/i.test(u); // some converters create "https!domain!path" placeholders
 
 async function fetchBuffer(u) {
   const url = httpToHttps(u);
@@ -66,14 +74,12 @@ async function fetchAsDataURL(u) {
 }
 
 /* ---------- SAFE @import INLINER (regex-based, no AST mutation) ---------- */
-// Recursively inlines @import rules using a conservative regex, then returns CSS.
 async function inlineCssImports(css, baseHref) {
   if (!css) return css;
 
   // Matches: @import url(...);  OR  @import "..."  OR  @import '...'
   const importRe = /@import\s+(?:url\(\s*([^)\s]+)\s*\)|(['"])(.*?)\2)([^;]*);/gi;
 
-  // Replace imports one by one (sequentially) to avoid overlapping indexes.
   let out = "";
   let lastIndex = 0;
   for (let m; (m = importRe.exec(css)); ) {
@@ -88,15 +94,11 @@ async function inlineCssImports(css, baseHref) {
         importUrl = httpToHttps(importUrl);
       }
     } catch {
-      // leave as-is if URL construction fails
+      continue;
     }
 
     let importedCss = await fetchText(importUrl);
-    if (!importedCss) {
-      // If we can't fetch it, drop the import (better than leaving outbound requests)
-      continue;
-    }
-    // Recursively inline nested imports and url(...) within imported CSS
+    if (!importedCss) continue;
     importedCss = await inlineCssImports(importedCss, importUrl);
     importedCss = await inlineCssUrls(importedCss, importUrl);
     out += importedCss;
@@ -105,7 +107,7 @@ async function inlineCssImports(css, baseHref) {
   return out;
 }
 
-/* ---------- url(...) INLINER (css-tree based, with try/catch fallback) ---------- */
+/* ---------- url(...) INLINER (css-tree with regex fallback) ---------- */
 async function inlineCssUrls(css, baseHref = "") {
   if (!css) return css;
 
@@ -117,7 +119,7 @@ async function inlineCssUrls(css, baseHref = "") {
       if (node.type === "Url" && node.value) {
         const raw0 = String(node.value);
         const raw = raw0.replace(/^['"]|['"]$/g, "");
-        if (raw.startsWith("data:")) return;
+        if (raw.startsWith("data:") || isEmbedded(raw)) return;
 
         // Resolve relative
         let u = raw;
@@ -139,80 +141,60 @@ async function inlineCssUrls(css, baseHref = "") {
     await Promise.all(tasks);
     return csstree.generate(ast);
   } catch {
-    // Fallback: lightweight regex for url(...). Not perfect, but safe.
-    return await cssUrlRegexInline(css, baseHref);
-  }
-}
+    // Fallback: simple url(...) regex
+    const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
+    const parts = [];
+    let last = 0, m;
+    while ((m = urlRe.exec(css))) {
+      parts.push(css.slice(last, m.index));
+      last = urlRe.lastIndex;
 
-async function cssUrlRegexInline(css, baseHref = "") {
-  const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
-  const parts = [];
-  let last = 0, m;
-  while ((m = urlRe.exec(css))) {
-    parts.push(css.slice(last, m.index));
-    last = urlRe.lastIndex;
-
-    let u = m[2];
-    if (u.startsWith("data:")) { parts.push(`url(${m[1]}${u}${m[1]})`); continue; }
-    try {
-      if (baseHref && !/^https?:|^data:|^\/\//i.test(u)) {
-        u = new URL(u, httpToHttps(baseHref)).toString();
-      } else {
-        u = httpToHttps(u);
+      let u = m[2];
+      if (u.startsWith("data:") || isEmbedded(u)) {
+        parts.push(`url(${m[1]}${u}${m[1]})`);
+        continue;
       }
-    } catch { /* ignore */ }
+      try {
+        if (baseHref && !/^https?:|^data:|^\/\//i.test(u)) {
+          u = new URL(u, httpToHttps(baseHref)).toString();
+        } else {
+          u = httpToHttps(u);
+        }
+      } catch { /* ignore */ }
 
-    const dataURL = await fetchAsDataURL(u);
-    parts.push(`url(${m[1]}${dataURL || u}${m[1]})`);
+      const dataURL = await fetchAsDataURL(u);
+      parts.push(`url(${m[1]}${dataURL || u}${m[1]})`);
+    }
+    parts.push(css.slice(last));
+    return parts.join("");
   }
-  parts.push(css.slice(last));
-  return parts.join("");
 }
 
-/* ---------- HTML INLINER ---------- */
+/* ---------- HTML INLINER (CONSERVATIVE) ---------- */
 async function inlineEverything(html, docUrl = "") {
   const $ = cheerio.load(html, { decodeEntities: false });
 
-  // Remove trackers/ads & hints that cause outbound requests
-  $('script[src*="doubleclick"],script[src*="googletag"],script[src*="tr.snapchat"],script[src*="stripe"]').remove();
-  $('link[rel="preconnect"],link[rel="dns-prefetch"],link[rel="preload"],link[rel="prefetch"]').remove();
-
-  // Icons
-  for (const el of $('link[rel="icon"],link[rel="shortcut icon"],link[rel="apple-touch-icon"]').toArray()) {
-    const href = $(el).attr("href");
-    if (!href) continue;
-    let abs = href;
-    try {
-      if (docUrl && !/^https?:|^data:|^\/\//i.test(href)) abs = new URL(href, httpToHttps(docUrl)).toString();
-    } catch { /* ignore */ }
-    const data = await fetchAsDataURL(abs);
-    if (data) $(el).attr("href", data);
-  }
-
-  // Stylesheets -> <style>
+  // 1) Stylesheets: inline ONLY if clearly external http(s). Leave cid:/blob:/data:/placeholders intact.
   for (const el of $('link[rel="stylesheet"][href]').toArray()) {
     const href = $(el).attr("href");
-    if (!href) continue;
-    let abs = href;
-    try {
-      if (docUrl && !/^https?:|^data:|^\/\//i.test(href)) abs = new URL(href, httpToHttps(docUrl)).toString();
-    } catch { /* ignore */ }
-    let css = await fetchText(abs);
-    if (!css) continue;
-    css = await inlineCssImports(css, abs);
-    css = await inlineCssUrls(css, abs);
+    if (!href || isEmbedded(href)) continue;
+    if (!/^https?:\/\//i.test(href)) continue;
+
+    let css = await fetchText(href);
+    if (!css) continue; // keep original if fetch fails
+    css = await inlineCssImports(css, href);
+    css = await inlineCssUrls(css, href);
     $(el).replaceWith(`<style>${css}</style>`);
   }
 
-  // <style> blocks (inline @import + url(...))
+  // 2) <style> blocks: only inline url(...) (don’t attempt to resolve @import without a base)
   for (const el of $("style").toArray()) {
-    let css = $(el).html() || "";
-    css = await inlineCssImports(css, docUrl);
-    css = await inlineCssUrls(css, docUrl);
-    $(el).html(css);
+    const css = $(el).html() || "";
+    const inlined = await inlineCssUrls(css, docUrl);
+    $(el).html(inlined);
   }
 
-  // Inline style="" attributes
+  // 3) style="" attributes: url(...) only
   for (const el of $("[style]").toArray()) {
     const css = $(el).attr("style");
     if (!css) continue;
@@ -220,35 +202,35 @@ async function inlineEverything(html, docUrl = "") {
     $(el).attr("style", inlined);
   }
 
-  // Images -> data:
+  // 4) Images: inline ONLY if external http(s). Leave embedded/relative alone (they came from MHTML).
   for (const el of $("img[src]").toArray()) {
     const src = $(el).attr("src");
-    if (!src || src.startsWith("data:")) continue;
-    let abs = src;
-    try {
-      if (docUrl && !/^https?:|^data:|^\/\//i.test(src)) abs = new URL(src, httpToHttps(docUrl)).toString();
-    } catch { /* ignore */ }
-    const data = await fetchAsDataURL(abs);
+    if (!src || isEmbedded(src)) continue;
+    if (!/^https?:\/\//i.test(src)) continue;
+    const data = await fetchAsDataURL(src);
     if (data) $(el).attr("src", data);
   }
 
-  // Scripts -> inline text (skip ones we removed above)
+  // 5) Scripts: inline ONLY if external http(s). Leave embedded/relative alone.
   for (const el of $('script[src]').toArray()) {
     const src = $(el).attr("src");
-    if (!src) continue;
-    let abs = src;
-    try {
-      if (docUrl && !/^https?:|^data:|^\/\//i.test(src)) abs = new URL(src, httpToHttps(docUrl)).toString();
-    } catch { /* ignore */ }
-    const js = await fetchText(abs);
-    if (!js) continue;
+    if (!src || isEmbedded(src)) continue;
+    if (!/^https?:\/\//i.test(src)) continue;
+    const js = await fetchText(src);
+    if (!js) continue;               // keep original if fetch fails
     $(el).removeAttr("src").text(js);
   }
 
-  // iframes often point to trackers/ads – drop them for single-file output
-  $("iframe").remove();
+  // 6) Icons: inline ONLY if external http(s).
+  for (const el of $('link[rel="icon"],link[rel="shortcut icon"],link[rel="apple-touch-icon"]').toArray()) {
+    const href = $(el).attr("href");
+    if (!href || isEmbedded(href)) continue;
+    if (!/^https?:\/\//i.test(href)) continue;
+    const data = await fetchAsDataURL(href);
+    if (data) $(el).attr("href", data);
+  }
 
-  // Last-resort: upgrade any remaining absolute http:// links to https://
+  // 7) Last resort: upgrade any remaining absolute http:// links to https://
   $('link[href], img[src], script[src]').each((_, el) => {
     const $el = $(el);
     const attr = $el.is("link") ? "href" : "src";
@@ -273,7 +255,7 @@ for (const file of files) {
     throw new Error("fast-mhtml2html did not return an HTML string");
   }
 
-  // Step 2: Inline everything
+  // Step 2: Inline external bits, preserve embedded ones
   const finalHtml = await inlineEverything(html1 /* docUrl unknown */);
 
   // Write output
@@ -289,7 +271,7 @@ for (const file of files) {
 const indexHtml = `<!doctype html>
 <meta charset="utf-8">
 <title>MHTML builds</title>
-<h1>MHTML builds (self-contained)</h1>
+<h1>MHTML builds (self-contained, layout-safe)</h1>
 <ul>
 ${links.join("\n")}
 </ul>`;
